@@ -1,0 +1,32 @@
+Single GPU mode on device cuda
+Free VRAM 23.4166259765625 GB
+/workspace/LongLive/wan/modules/vae.py:634: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  torch.load(pretrained_path, map_location=device), assign=True)
+KV inference with 3 frames per block
+/workspace/LongLive/inference.py:74: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+LoRA enabled with config: {'type': 'lora', 'rank': 256, 'alpha': 256, 'dropout': 0.0, 'dtype': 'bfloat16', 'verbose': False}
+Applying LoRA to generator (inference)...
+LoRA target modules for generator: 300 Linear layers
+Traceback (most recent call last):
+  File "/workspace/LongLive/inference.py", line 107, in <module>
+    pipeline.generator.model = configure_lora_for_model(
+  File "/workspace/LongLive/utils/lora_utils.py", line 69, in configure_lora_for_model
+    lora_model = peft.get_peft_model(transformer, peft_config)
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/mapping_func.py", line 114, in get_peft_model
+    return PeftModel(
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/peft_model.py", line 129, in __init__
+    self.base_model = cls(model, {adapter_name: peft_config}, adapter_name)
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 315, in __init__
+    self.inject_adapter(self.model, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage, state_dict=state_dict)
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 913, in inject_adapter
+    self._create_and_replace(
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/tuners/lora/model.py", line 269, in _create_and_replace
+    new_module = self._create_new_module(lora_config, adapter_name, target, device_map=device_map, **kwargs)
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/tuners/lora/model.py", line 418, in _create_new_module
+    new_module = dispatcher(target, adapter_name, config=lora_config, **kwargs)
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/tuners/lora/torchao.py", line 142, in dispatch_torchao
+    if not is_torchao_available():
+  File "/workspace/LongLive/.venv/lib/python3.10/site-packages/peft/import_utils.py", line 143, in is_torchao_available
+    raise ImportError(
+ImportError: Found an incompatible version of torchao. Found version 0.7.0, but only versions above 0.16.0 are supported

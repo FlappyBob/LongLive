@@ -1,0 +1,4 @@
+status=1
+wall_time_s=212
+peak_vram_mb=24192
+timestamp_utc=2026-04-25T19:05:52Z

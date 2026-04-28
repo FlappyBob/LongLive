@@ -10,13 +10,13 @@ try:
             return major >= 9  # Hopper Compute Capability == 9.0
         return False
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     FLASH_ATTN_2_AVAILABLE = False
 
 # FLASH_ATTN_3_AVAILABLE = False
@@ -63,6 +63,20 @@ def flash_attention(
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+            )
+
+        q = q.transpose(1, 2).to(dtype)
+        k = k.transpose(1, 2).to(dtype)
+        v = v.transpose(1, 2).to(dtype)
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=causal, dropout_p=dropout_p)
+        return out.transpose(1, 2).contiguous().type(out_dtype)
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)

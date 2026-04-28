@@ -1,179 +1,237 @@
-# DMD — 分布匹配蒸馏损失
+# DMD 模型：分布匹配蒸馏·generator_loss·critic_loss
 
-**文件**：[model/dmd.py](../model/dmd.py)  
-**基类**：[model/base.py](../model/base.py)
-
----
-
-## 一、定位
-
-`DMD`（Distribution Matching Distillation）是训练的**损失计算核心**，实现了从 14B 教师模型向 1.3B 学生模型的知识蒸馏。
-
-架构继承关系：
-```
-BaseModel (model/base.py)
-└── SelfForcingModel
-    └── DMD (model/dmd.py)
-        └── DMDSwitch (model/dmd_switch.py)  ← 增加 prompt 切换训练
-```
+> 核心文件：[model/dmd.py](../model/dmd.py)，[model/base.py](../model/base.py)，  
+> [model/dmd_switch.py](../model/dmd_switch.py)
 
 ---
 
-## 二、BaseModel 初始化
+## 一、DMD 是什么
 
-```python
-BaseModel._initialize_models(args, device):
-    self.generator   = WanDiffusionWrapper(is_causal=True,  ...)   # 待训练，grad=True
-    self.real_score  = WanDiffusionWrapper(is_causal=False, real_name)  # 教师，grad=False
-    self.fake_score  = WanDiffusionWrapper(is_causal=False, fake_name)  # Critic，grad=True
-    self.text_encoder = WanTextEncoder()   # grad=False
-    self.vae          = WanVAEWrapper()    # grad=False
+DMD（Distribution Matching Distillation，[论文](https://arxiv.org/abs/2311.18828)）是 LongLive 的训练损失框架。
+
 ```
+核心思路：
+  传统扩散模型需要 1000 步去噪，每步调用一次大模型
+  DMD 用"分数匹配"方法，让少步（4步）的"学生模型"逼近多步的"教师分布"
 
-三个 Diffusion 模型的角色：
-
-| 模型 | 参数量 | 梯度 | 作用 |
-|------|--------|------|------|
-| `generator` | 1.3B（因果） | ✓ | 被训练的生成器 |
-| `real_score` | 14B（非因果） | ✗ | 教师模型，提供真实分布的梯度指导 |
-| `fake_score` | 1.3B（非因果） | ✓ | Critic，拟合生成器的输出分布 |
+LongLive 的 DMD 架构：
+  ┌─────────────────────────┐
+  │  generator（学生）       │  ← 训练目标，产生视频
+  │  fake_score（评判器）    │  ← 评估"学生"生成有多像真实
+  └─────────────────────────┘
+  + real_score（教师）       ← 预训练的 Wan 模型，不更新参数
+```
 
 ---
 
-## 三、DMD 损失原理
+## 二、`SelfForcingModel` 基类
 
-基于论文 [DMD2: arxiv/2311.18828]。
-
-### KL 梯度（eq.7）
-
-```
-给定生成器输出 x0（fake video），在随机 timestep t 加噪得到 xt
-
-fake_score(xt | prompt) → pred_fake_x0    ← Critic 认为 xt 来自哪里
-real_score(xt | prompt) → pred_real_x0    ← 教师认为 xt 来自哪里
-
-KL梯度 = pred_fake_x0 - pred_real_x0
-
-直觉：如果 fake > real，说明 Critic 认为这个位置更像生成物而非真实数据
-      → Generator 需要往 real 方向优化
-```
-
-### 梯度归一化（eq.8）
+文件：[model/base.py](../model/base.py)
 
 ```python
-p_real = (x0_estimated - pred_real_x0)  # 真实 score 的"残差"
-normalizer = abs(p_real).mean(dim=[1,2,3,4], keepdim=True)
-grad = grad / normalizer                  # 防止梯度量级随 timestep 变化
+class SelfForcingModel(nn.Module):
+    def __init__(self, args, device):
+        # generator: 学生模型（CausalWanModel，需要训练）
+        self.generator = WanDiffusionWrapper(is_causal=args.causal, ...)
+        
+        # fake_score: 评判器（同架构但参数独立，用于 DMD 损失）
+        self.fake_score = WanDiffusionWrapper(is_causal=False, ...)
+        
+        # text_encoder: UMT5（只在主进程初始化，其他 rank 靠 broadcast）
+        self.text_encoder = WanTextEncoder()
+        
+        # vae: 编解码（eval 模式，不训练）
+        self.vae = WanVAEWrapper()
+        
+        # scheduler
+        self.scheduler = generator.get_scheduler()
 ```
-
-### DMD Loss
-
-```python
-dmd_loss = 0.5 × MSE(x0, (x0 - grad).detach())
-```
-
-这等价于让 `x0` 朝 `x0 - grad` 方向移动（伪目标，梯度已 detach），实际梯度是 `grad` 本身。
 
 ---
 
-## 四、generator_loss()
+## 三、DMD 前向传播
 
-```python
-generator_loss(image_or_video_shape, conditional_dict, unconditional_dict, clean_latent, initial_latent)
-    → (dmd_loss, log_dict)
+文件：[model/dmd.py](../model/dmd.py)
+
 ```
-
-步骤：
+DMD.forward(noise, conditional_dict, unconditional_dict)
+│
+├── [Step 1] 生成视频（Self-Forcing 方式）
+│   → inference_pipeline.generate(noise, cond)
+│   → 得到 estimated_x0（学生模型生成的视频）
+│
+├── [Step 2] 计算 KL 散度梯度（评判质量）
+│   → _compute_kl_grad(estimated_x0, cond, uncond)
+│   → 得到 kl_grad（指导学生向真实分布移动的梯度方向）
+│
+├── [Step 3] 反向传播
+│   → estimated_x0.backward(kl_grad)
+│   → generator 的参数得到梯度更新
+│
+└── [Step 4] 更新 fake_score（对抗训练）
+    → _compute_fake_score_loss(kl_grad, estimated_x0, cond)
 ```
-1. _run_generator:
-   SelfForcingTrainingPipeline.inference_with_trajectory(noise, ...)
-   → pred_image [B, F, C, H, W]（fake 视频）
-   → gradient_mask（哪些帧需要梯度）
-   → timestep_from, timestep_to（去噪步骤范围）
-
-2. compute_distribution_matching_loss(pred_image, ...):
-   → 随机采样 timestep（基于 ts_schedule 限制范围）
-   → add_noise 得到 noisy_latent
-   → _compute_kl_grad → grad
-   → dmd_loss = 0.5 × MSE(pred_image, pred_image - grad)
-```
-
-### Timestep 调度（ts_schedule）
-
-```python
-min_timestep = denoised_timestep_to   if ts_schedule else 0
-max_timestep = denoised_timestep_from if ts_schedule_max else 1000
-```
-
-如果 Generator 当前从 t=750 去噪到 t=500，则 DMD loss 的 timestep 也限制在 [500, 750] 范围内，聚焦在最相关的噪声级别。
 
 ---
 
-## 五、critic_loss()
+## 四、`_compute_kl_grad`：核心损失
+
+文件：[model/dmd.py:60-130](../model/dmd.py)
 
 ```python
-critic_loss(image_or_video_shape, ...)
-    → (denoising_loss, log_dict)
+def _compute_kl_grad(self, noisy_video, estimated_clean_video, timestep,
+                     conditional_dict, unconditional_dict, normalization=True):
+    """
+    计算 KL 散度梯度（DMD 论文的公式 7）。
+    
+    直觉：
+    - fake_score 评估"学生生成的带噪声视频在 timestep t 时"的得分
+    - real_score（= 真实扩散模型）评估同一视频的得分
+    - 梯度 = fake_score - real_score
+      → 指导学生往"fake_score 低、real_score 高"的方向走
+      → 即：让学生生成更像真实数据分布的视频
+    """
+    
+    # Step 1: 从学生预测出的干净帧 x0 计算带噪声的 x_t
+    # （随机采样一个训练用的 timestep）
+    noisy_image_or_video = scheduler.add_noise(estimated_clean_video, noise, timestep)
+    
+    # Step 2: fake_score 对带噪声的学生输出打分
+    # （fake_score 是一个扩散模型，它评估 x_t 在 timestep t 时的"干净程度"）
+    with torch.no_grad():
+        fake_flow_pred = fake_score.forward(
+            noisy_image_or_video, conditional_dict, timestep
+        )
+        fake_pred_x0 = _convert_flow_pred_to_x0(fake_flow_pred, noisy_video, timestep)
+    
+    # Step 3: real_score（教师/基础 Wan 模型）对同一带噪声视频打分
+    with torch.no_grad():
+        real_flow_pred = self.real_score(...)  # 不参与训练
+        real_pred_x0 = _convert_flow_pred_to_x0(real_flow_pred, noisy_video, timestep)
+    
+    # Step 4: 计算 KL 梯度
+    # 公式：grad = (1/σ_t²) × (fake_x0 - real_x0)
+    kl_grad = (fake_pred_x0 - real_pred_x0) / (sigma_t ** 2)
+    
+    # Step 5: 归一化（防止梯度过大）
+    if normalization:
+        kl_grad = kl_grad / kl_grad.abs().mean()
+    
+    return kl_grad, log_dict
 ```
 
-步骤：
-```
-1. with torch.no_grad(): generator unroll → generated_image（fake）
-2. 随机 timestep 加噪 → noisy_generated
-3. fake_score(noisy_generated) → pred_fake_x0
-4. denoising_loss = MSE(generated_image, pred_fake_x0)
-   （训练 Critic 去拟合生成器的分布）
-```
+**直觉理解**：
 
-Critic 的损失是普通的去噪 MSE，让 Critic 学会"认识"生成器产生的图像分布。
+```
+fake_score ≈ 学生自己的评判，带有"自我认知偏差"
+real_score ≈ 真实数据分布的评判（更可靠）
+
+fake_x0 - real_x0 = 学生认为"好"但真实认为"坏"的方向
+  → 梯度指向"让学生不再犯这种错误"的方向
+
+当 fake_x0 = real_x0 时，梯度为 0，训练收敛
+```
 
 ---
 
-## 六、训练交替策略
-
-在 `Trainer.train()` 中：
+## 五、fake_score 的更新
 
 ```python
-TRAIN_GENERATOR = (step % dfake_gen_update_ratio == 0)
-# dfake_gen_update_ratio = 5，即每 5 步更新一次 Generator，每步更新一次 Critic
+def _compute_fake_score_loss(self, kl_grad, estimated_x0, timestep, cond):
+    """
+    fake_score 作为判别器，需要区分"学生生成的视频"（fake）
+    和"在学生预测的 x0 上重新加噪得到的新 x_t"（也是 fake，但更接近真实）
+    """
+    # 计算 fake_score 的分类损失（类似 GAN 的 discriminator loss）
+    fake_score_loss = F.mse_loss(fake_pred, target_pred)
+    return fake_score_loss
 ```
 
-```
-step 0: critic_loss → critic.backward() → critic.step()
-step 1: critic_loss → ...
-step 2: critic_loss → ...
-step 3: critic_loss → ...
-step 4: critic_loss → ...
-step 5: generator_loss + critic_loss → generator.step() + critic.step()
-step 6: critic_loss → ...
-...
-```
-
-这种安排让 Critic 比 Generator 更新更频繁，保证 Critic 能紧跟 Generator 的分布变化。
+fake_score 的更新使它更准确地评估学生模型的输出，从而提供更有用的梯度信号。
 
 ---
 
-## 七、DMDSwitch 扩展
+## 六、DMDSwitch（阶段二）
 
-`DMDSwitch`（[model/dmd_switch.py](../model/dmd_switch.py)）在 `DMD` 基础上增加了 prompt 切换训练支持：
+文件：[model/dmd_switch.py](../model/dmd_switch.py)
 
-- `generator_loss` 中使用 `switch_conditional_dict` 和 `switch_frame_index`
-- 生成时在 `switch_frame_index` 处切换 prompt（通过 `SwitchCausalInferencePipeline`）
-- 让 Generator 学会在切换 prompt 时保持视觉连贯性
+`DMDSwitch` 在 `DMD` 基础上增加了 prompt 切换训练：
+
+```python
+class DMDSwitch(DMD):
+    def forward(self, noise, conditional_dict_list, switch_frame_indices):
+        # conditional_dict_list: 多个 prompt 的嵌入列表
+        # switch_frame_indices: 切换位置
+        
+        # 使用 StreamingSwitchTrainingPipeline 生成带切换的视频
+        output = self.inference_pipeline.generate_with_switch(
+            noise, conditional_dict_list, switch_frame_indices,
+            requires_grad=True
+        )
+        
+        # 计算多段的 KL 梯度（每段 prompt 用对应的 cond）
+        for seg_idx, (start, end) in enumerate(segments):
+            kl_grad_seg = self._compute_kl_grad(
+                output[:, start:end],
+                conditional_dict=conditional_dict_list[seg_idx],
+                ...
+            )
+        ...
+```
 
 ---
 
-## 八、StreamingTrainingModel
-
-`model/streaming_training.py` 中的 `StreamingTrainingModel` 是阶段二训练的状态管理器：
+## 七、训练 timestep 采样策略
 
 ```python
-class StreamingTrainingModel:
-    def setup_sequence(conditional_dict, max_length=240, ...)
-    def generate_next_chunk(requires_grad) → (chunk, chunk_info)
-    def compute_generator_loss(chunk, chunk_info) → (loss, log_dict)
-    def compute_critic_loss(chunk, chunk_info) → (loss, log_dict)
-    def can_generate_more() → bool
+# model/dmd.py:40-53
+self.min_step = int(0.02 * num_train_timestep)   # = 20
+self.max_step = int(0.98 * num_train_timestep)   # = 980
+
+# ts_schedule: 训练初期用大 t（高噪声），后期用小 t（细节）
+if self.ts_schedule:
+    # 用 cosine schedule 在训练过程中逐渐减小 timestep 上界
+    max_t = cosine_decay(self.max_step, self.current_step)
+else:
+    max_t = self.max_step
+
+timestep = torch.randint(self.min_step, max_t, [B], device=device)
 ```
 
-它将长序列（240 帧）拆分为 21 帧的 chunk，每次 `generate_next_chunk` 推进一个 chunk，KV Cache 在 chunk 之间持续保持，实现了对显存的精细控制。
+**timestep 为什么要是随机的？**
+
+每个训练步骤的 `timestep` 是随机采样的（而不是固定的）。这样模型在所有噪声水平（从低噪到高噪）上都得到训练信号，避免过拟合到特定噪声级别。
+
+---
+
+## 八、guidance scale
+
+```python
+# model/dmd.py:44-49
+self.real_guidance_scale = args.real_guidance_scale   # 通常 1.0~7.5
+self.fake_guidance_scale = args.fake_guidance_scale   # 通常 0.0
+
+# Classifier-Free Guidance:
+# score_guided = score(cond) + scale × (score(cond) - score(uncond))
+```
+
+`real_guidance_scale > 1` 时，real_score 使用 CFG，让梯度信号更强（真实分布的评判更清晰）。
+`fake_guidance_scale = 0` 时，fake_score 不使用 CFG（避免训练不稳定）。
+
+---
+
+## 九、完整训练损失汇总
+
+```
+total_loss = generator_loss + fake_score_loss
+
+generator_loss:
+  - 主要：estimated_x0.backward(kl_grad)（DMD 分布匹配）
+  - 可选：+ flow_matching_loss（监督损失，防止模式崩溃）
+
+fake_score_loss:
+  - fake_score 的分类误差
+  - 用于让 fake_score 更准确地评估学生输出
+```
+
+**注意**：`generator_loss` 不是一个标准的 PyTorch loss（因为梯度方向是手动指定的），而是通过 `estimated_x0.backward(kl_grad)` 直接把 KL 梯度"注入"计算图。

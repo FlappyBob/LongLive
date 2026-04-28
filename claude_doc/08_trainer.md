@@ -1,213 +1,257 @@
-# Trainer — 分布式训练调度器
+# Trainer：训练主循环·LoRA 配置·Checkpoint 管理
 
-**文件**：[trainer/distillation.py](../trainer/distillation.py)
-
----
-
-## 一、定位
-
-`Trainer` 是**整个训练系统的总调度器**，负责：
-1. 分布式环境初始化（FSDP、rank、seed）
-2. 模型初始化（Generator、Critic、TextEncoder、VAE）
-3. LoRA 配置与加载
-4. Optimizer、EMA、DataLoader 初始化
-5. Checkpoint 保存/恢复
-6. 训练主循环（generator_loss + critic_loss）
-7. 可视化（定期生成样本视频）
+> 核心文件：[trainer/distillation.py](../trainer/distillation.py)
 
 ---
 
-## 二、初始化流程
+## 一、Trainer 类层级
 
 ```
-Trainer.__init__(config)
-│
-├── Step 1: 分布式初始化
-│   ├── launch_distributed_job()          # torchrun 入口
-│   ├── dist.get_rank(), get_world_size()
-│   └── set_seed(config.seed + rank)
-│
-├── Step 2: W&B / OneLogger 日志初始化
-│
-├── Step 3: 模型初始化
-│   ├── 根据 distribution_loss 选择模型类:
-│   │   ├── "dmd"        → DMD(config)
-│   │   ├── "dmd_switch" → DMDSwitch(config)
-│   │   └── "causvid"    → CausVid(config)
-│   ├── LoRA 配置（如果 config.adapter 存在）
-│   │   ├── 加载 base checkpoint
-│   │   ├── _configure_lora_for_model(generator)  ← PEFT LoraConfig rank=256
-│   │   ├── _configure_lora_for_model(fake_score)
-│   │   └── 加载 LoRA checkpoint（如有）
-│   ├── fsdp_wrap(generator)       # FSDP 分片
-│   ├── fsdp_wrap(real_score)
-│   ├── fsdp_wrap(fake_score)
-│   └── fsdp_wrap(text_encoder)
-│
-├── Step 4: EMA 初始化（ema_weight=0.99）
-│
-├── Step 5: Optimizer 初始化
-│   ├── generator_optimizer = AdamW(lr=1e-5, β=(0,0.999))
-│   └── critic_optimizer    = AdamW(lr=2e-6, β=(0,0.999))
-│
-├── Step 6: DataLoader 初始化
-│   ├── TextDataset(data_path)  ← 纯文本提示词文件
-│   └── DistributedSampler
-│
-├── Step 7: Checkpoint 恢复（auto_resume）
-│
-└── Step 8: StreamingTrainingModel 初始化（如果 streaming_training=True）
+Trainer（基类）
+    └── ScoreDistillationTrainer（实际使用）
+            ├── 初始化模型（DMD / DMDSwitch）
+            ├── 配置 FSDP 分布式训练
+            ├── 配置 LoRA（阶段二）
+            ├── 配置优化器 & 学习率调度
+            └── train() 主循环
 ```
 
 ---
 
-## 三、训练主循环
+## 二、`Trainer.__init__` 初始化顺序
 
 ```python
-def train():
-    while True:
-        TRAIN_GENERATOR = (step % dfake_gen_update_ratio == 0)  # 每 5 步更新一次 Generator
-
-        if streaming_training:
-            # 流式训练路径
-            if not streaming_active:
-                start_new_sequence()  # 获取新 batch，设置序列
-            if not streaming_model.can_generate_more():
-                start_new_sequence()  # 当前序列生成完了
-
-            fwdbwd_one_step_streaming(train_generator=TRAIN_GENERATOR)
-
-        else:
-            # 标准训练路径（阶段一）
-            batch = next(dataloader)
-            fwdbwd_one_step(batch, train_generator=TRAIN_GENERATOR)
-
-        optimizer.step()
-        step += 1
-
-        if step % log_iters == 0:
-            save()
-        if step % vis_interval == 0:
-            _visualize()
-        if step > max_iters:
-            break
-```
-
----
-
-## 四、fwdbwd_one_step() — 标准训练一步
-
-```
-1. text_encoder(prompts) → conditional_dict
-2. text_encoder([negative_prompt]) → unconditional_dict  (第一次后缓存)
-
-if train_generator:
-    3. model.generator_loss(...)
-       → SelfForcingTrainingPipeline.inference_with_trajectory  (unroll)
-       → compute_distribution_matching_loss (DMD grad)
-    4. loss.backward()
-    → 返回 generator_log_dict
-
-else:
-    5. model.critic_loss(...)
-       → generator unroll (no_grad)
-       → fake_score denoising loss
-    6. loss.backward()
-    → 返回 critic_log_dict
-```
-
----
-
-## 五、fwdbwd_one_step_streaming() — 流式训练一步
-
-```
-if train_generator:
-    if current_seq_length == 0:
-        generate_next_chunk(requires_grad=False)  # 先无梯度跑一个 warmup chunk
-    generated_chunk, chunk_info = generate_next_chunk(requires_grad=True)
-    generator_loss, _ = streaming_model.compute_generator_loss(chunk, chunk_info)
-    loss.backward()
-
-else:
-    if current_seq_length == 0:
-        generate_next_chunk(requires_grad=False)
-    generated_chunk, chunk_info = generate_next_chunk(requires_grad=False)
-    critic_loss, _ = streaming_model.compute_critic_loss(chunk, chunk_info)
-    loss.backward()
-```
-
-**为什么第一个 chunk 不带梯度？**  
-第一个 chunk 的历史上下文是空的（KV Cache 全 0），对应的损失不具有代表性，跳过可以稳定训练。
-
----
-
-## 六、LoRA 配置
-
-```python
-def _configure_lora_for_model(transformer, model_name):
-    # 找所有 CausalWanAttentionBlock 下的 Linear 层
-    target_linear_modules = [所有 attn + ffn 的 Linear]
-
-    peft_config = LoraConfig(
-        r=256,           # LoRA rank
-        lora_alpha=256,  # 缩放系数（通常 = rank）
-        lora_dropout=0.0,
-        target_modules=target_linear_modules
+def __init__(self, config):
+    # 1. 初始化分布式环境
+    launch_distributed_job()          # 设置 rank, world_size, device
+    
+    # 2. 初始化日志（wandb / one_logger）
+    wandb.init(...)
+    
+    # 3. 加载基础模型权重（Wan 预训练）
+    generator_ckpt = torch.load(config.generator_ckpt)
+    generator.load_state_dict(generator_ckpt)
+    
+    # 4. FSDP 包装（多卡分布式）
+    self.generator = fsdp_wrap(generator)
+    self.fake_score = fsdp_wrap(fake_score)
+    
+    # 5. 初始化推理 Pipeline
+    self.inference_pipeline = StreamingTrainingPipeline(
+        generator=self.generator, ...
     )
-    return peft.get_peft_model(transformer, peft_config)
+    
+    # 6. 配置 LoRA（如果是阶段二）
+    if config.use_lora:
+        configure_lora_for_model(generator.model, rank=256, alpha=256)
+    
+    # 7. 优化器
+    self.optimizer = torch.optim.AdamW(
+        trainable_params, lr=config.lr, weight_decay=0.01
+    )
+    
+    # 8. 学习率调度
+    self.scheduler = get_cosine_schedule_with_warmup(
+        self.optimizer, num_warmup_steps=config.warmup_steps
+    )
+    
+    # 9. 自动 Resume（如果 logdir 有 checkpoint）
+    if config.auto_resume:
+        self._maybe_load_checkpoint()
 ```
-
-LoRA 插入到 Generator 的所有 attention + FFN linear 层，冻结基础权重，只训练 A、B 矩阵。
-参数量：rank=256 的 LoRA 对 1.3B 模型大约增加 ~100M 可训练参数。
 
 ---
 
-## 七、Checkpoint 管理
+## 三、训练主循环 `train()`
 
 ```python
-def save():
-    # LoRA 模式: 只保存 LoRA 权重（几十 MB）
-    state_dict = {
-        "generator_lora": get_peft_model_state_dict(generator),
-        "critic_lora": get_peft_model_state_dict(fake_score),
-        "step": self.step
-    }
-
-    # 非 LoRA 模式: 保存完整权重
-    state_dict = {
-        "generator": FSDP.full_state_dict(generator),
-        "critic": FSDP.full_state_dict(fake_score),
-        "generator_ema": ema.state_dict(),
-        "generator_optimizer": FSDP.optim_state_dict(...),
-        "critic_optimizer": ...,
-        "step": self.step
-    }
-
-    torch.save(state_dict, f"checkpoint_model_{step:06d}/model.pt")
-    cleanup_old_checkpoints(max_checkpoints=3)  # 只保留最新 3 个
+def train(self):
+    for self.step in range(start_step, total_steps):
+        
+        # Step 1: 读取一个 batch（text prompt）
+        batch = next(self.dataloader)
+        text_prompts = batch["prompts"]
+        
+        # Step 2: 文本编码
+        conditional_dict = text_encoder(text_prompts)
+        
+        # Step 3: 采样随机噪声（latent 空间）
+        noise = torch.randn([B, F, 16, 60, 104], device=device)
+        
+        # Step 4: 初始化 KV Cache（每个 step 重新初始化）
+        pipeline.initialize_kv_cache(batch_size, ...)
+        
+        # Step 5: Warmup chunk（no_grad）
+        output_warmup = pipeline.generate_chunk_with_cache(
+            noise[:, :warmup_frames], cond, requires_grad=False
+        )
+        
+        # Step 6: Training chunk（with grad）
+        output_train = pipeline.generate_chunk_with_cache(
+            noise[:, warmup_frames:], cond,
+            current_start_frame=warmup_frames, requires_grad=True
+        )
+        
+        # Step 7: 计算损失
+        loss, log_dict = model.compute_loss(output_train, cond, ...)
+        
+        # Step 8: 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+        optimizer.step()
+        lr_scheduler.step()
+        
+        # Step 9: EMA 更新（可选）
+        if use_ema:
+            ema.update()
+        
+        # Step 10: 日志 & 可视化
+        if step % log_every == 0:
+            wandb.log(log_dict)
+        if step % vis_every == 0:
+            visualize(output_train)
+        
+        # Step 11: Checkpoint 保存
+        if step % save_every == 0:
+            self._save_checkpoint()
 ```
 
 ---
 
-## 八、关键配置参数（longlive_train_long.yaml）
+## 四、LoRA 配置
 
-```yaml
-distribution_loss: dmd_switch     # 使用 DMDSwitch（支持 prompt 切换训练）
-real_name: Wan2.1-T2V-14B         # 教师模型（14B）
-fake_name: Wan2.1-T2V-1.3B        # Critic 模型（1.3B）
-model_kwargs:
-  local_attn_size: 12             # 12 帧滑动窗口
-  sink_size: 3                    # 3 帧 Frame Sink
-  timestep_shift: 5.0
+文件：[utils/lora_utils.py](../utils/lora_utils.py)
 
-streaming_training: true
-streaming_chunk_size: 21          # 每 chunk 21 帧
-streaming_max_length: 240         # 最大序列 240 帧
-
-dfake_gen_update_ratio: 5         # Generator:Critic = 1:5 更新比率
-lr: 1e-5                          # Generator 学习率
-lr_critic: 2e-6                   # Critic 学习率（更小）
-adapter:
-  rank: 256                       # LoRA rank
-max_iters: 3000                   # 训练步数
+```python
+def configure_lora_for_model(model, model_name, lora_config, is_main_process=True):
+    from peft import LoraConfig, get_peft_model
+    
+    peft_config = LoraConfig(
+        r=lora_config.rank,          # 256（接近全参数微调）
+        lora_alpha=lora_config.alpha, # 256（缩放比 = alpha/r = 1.0）
+        lora_dropout=lora_config.dropout,  # 0.0
+        target_modules=["q", "k", "v", "o"],  # 注意力的 QKV + 输出层
+        bias="none",
+    )
+    
+    model = get_peft_model(model, peft_config)
+    return model
 ```
+
+**为什么 rank=256 这么大？**
+
+标准 LoRA 的 rank 通常是 4~64。LongLive 用 256 是因为：
+- 阶段一训练了完整参数（2.5GB）
+- 阶段二需要学习的"长视频一致性"是个复杂的能力，小 rank 学不了
+- `alpha=rank=256` 使缩放比 = 1，实际效果接近全参数微调
+
+---
+
+## 五、Checkpoint 管理
+
+### 5.1 保存格式
+
+```python
+# trainer/distillation.py 的 _save_checkpoint
+checkpoint = {
+    "step": self.step,
+    "generator": fsdp_state_dict(self.generator),     # 完整参数
+    "generator_ema": fsdp_state_dict(self.ema),       # EMA 参数（可选）
+    "fake_score": fsdp_state_dict(self.fake_score),
+    "optimizer": optimizer.state_dict(),
+    "lr_scheduler": lr_scheduler.state_dict(),
+}
+
+# LoRA 单独保存（体积小，方便分享）
+lora_state_dict = get_peft_model_state_dict(generator.model)
+torch.save({"generator_lora": lora_state_dict}, lora_ckpt_path)
+
+torch.save(checkpoint, checkpoint_path)
+```
+
+### 5.2 自动 Resume
+
+```python
+def _maybe_load_checkpoint(self):
+    # 扫描 logdir 下的所有 checkpoint，加载最新的
+    checkpoints = sorted(glob(f"{self.output_path}/checkpoint_*.pt"))
+    if len(checkpoints) > 0:
+        latest = checkpoints[-1]
+        checkpoint = torch.load(latest)
+        generator.load_state_dict(checkpoint["generator"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        self.step = checkpoint["step"]
+```
+
+---
+
+## 六、EMA（Exponential Moving Average）
+
+```python
+# 训练时：
+ema_decay = 0.9999
+ema.update():
+    for ema_p, p in zip(ema_params, model_params):
+        ema_p.data = ema_decay * ema_p.data + (1 - ema_decay) * p.data
+
+# 推理时（use_ema=True）：
+raw_gen_state_dict = state_dict["generator_ema"]  # 用 EMA 权重推理
+```
+
+EMA 权重比普通权重更"平滑"，通常推理质量略好（去除训练过程中的噪声波动）。
+
+---
+
+## 七、分布式训练配置（FSDP）
+
+```python
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+# fsdp_wrap 函数（utils/distributed.py）
+def fsdp_wrap(model, ...):
+    return FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,  # 全分片
+        mixed_precision=MixedPrecision(param_dtype=torch.bfloat16),
+        auto_wrap_policy=transformer_auto_wrap_policy(
+            transformer_layer_cls={CausalWanAttentionBlock}
+        ),
+        device_id=torch.cuda.current_device()
+    )
+```
+
+FSDP 把模型参数切分到所有 GPU，每个 GPU 只保存 1/N 的参数。前向时 all-gather 收集完整参数，后向时 reduce-scatter 聚合梯度。
+
+---
+
+## 八、`launch_distributed_job`
+
+```python
+# utils/distributed.py
+def launch_distributed_job():
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    
+    # 设置 NCCL 超时（大模型通信可能很慢）
+    os.environ["NCCL_TIMEOUT"] = "1800"
+```
+
+训练用 `torchrun --nproc_per_node=8 train.py` 启动 8 进程，每进程占一张 GPU。
+
+---
+
+## 九、One Logger 集成
+
+```python
+# trainer/distillation.py:88-100
+from one_logger_utils import OneLoggerUtils
+
+# One Logger 是 NVIDIA 内部的实验追踪工具（类似 wandb）
+# 外部复现时用 --no-one-logger 跳过
+if self.use_one_logger and not self.disable_wandb:
+    OneLoggerUtils.on_train_start(config, app_tag, ...)
+```
+
+本 repo 提供了 `one_logger_utils.py` 的空 no-op 实现，外部用户不受影响。

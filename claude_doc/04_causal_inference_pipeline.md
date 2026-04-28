@@ -1,151 +1,256 @@
-# CausalInferencePipeline — 单提示词推理流水线
+# CausalInferencePipeline：推理主循环·时序去噪·Context Pass
 
-**文件**：[pipeline/causal_inference.py](../pipeline/causal_inference.py)
-
----
-
-## 一、定位
-
-`CausalInferencePipeline` 是**推理的基础类**，实现了单提示词、逐帧自回归视频生成的完整流程。
-`InteractiveCausalInferencePipeline` 和 `SwitchCausalInferencePipeline` 都继承自它。
+> 核心文件：[pipeline/causal_inference.py](../pipeline/causal_inference.py)
 
 ---
 
-## 二、初始化
+## 一、Pipeline 架构
+
+```
+CausalInferencePipeline(torch.nn.Module)
+│
+├── self.generator      : WanDiffusionWrapper  (CausalWanModel)
+├── self.text_encoder   : WanTextEncoder       (UMT5-XXL)
+├── self.vae            : WanVAEWrapper        (Video VAE)
+├── self.scheduler      : FlowMatchScheduler
+├── self.kv_cache1      : List[dict] × 30      (推理用 KV Cache)
+├── self.crossattn_cache: List[dict] × 30      (文本 KV Cache)
+├── self.denoising_step_list: [1000,750,500,250]
+├── self.num_frame_per_block: 3                (每块生成帧数)
+└── self.local_attn_size: 12                  (滑动窗口大小)
+```
+
+---
+
+## 二、推理流程全图
+
+```
+inference(noise, text_prompts)
+│
+├── 1. 文本编码
+│   WanTextEncoder(text_prompts) → conditional_dict
+│
+├── 2. 初始化 Cache
+│   _initialize_kv_cache(batch, dtype, device, kv_cache_size=12×1560)
+│   _initialize_crossattn_cache(batch, dtype, device)
+│   _set_all_modules_max_attention_size(local_attn_size=12)
+│
+└── 3. 时序去噪循环 (外层：逐帧块)
+    for current_num_frames in [3, 3, 3, ..., 3]:   # num_blocks = num_output_frames / 3
+    │
+    ├── 3.1 取当前帧块的初始噪声
+    │   noisy_input = noise[:, frame_start:frame_start+3]
+    │
+    ├── 3.2 空间去噪循环 (内层：多步去噪)
+    │   for t in [1000, 750, 500, 250]:
+    │   │
+    │   ├── [非最后步] generator(noisy_input, cond, t, kv_cache) → pred_x0
+    │   │   add_noise(pred_x0, t_next) → noisy_input  (加噪准备下步)
+    │   │
+    │   └── [最后步]  generator(noisy_input, cond, t=250, kv_cache) → denoised_pred
+    │
+    ├── 3.3 记录输出
+    │   output[:, frame_start:frame_start+3] = denoised_pred
+    │
+    ├── 3.4 Context Pass（更新干净帧的 KV Cache）
+    │   generator(denoised_pred, cond, t=0, kv_cache)  ← 输出丢弃
+    │
+    └── 3.5 更新帧指针
+        current_start_frame += current_num_frames
+    │
+    ▼
+    4. VAE 解码
+    vae.decode_to_pixel(output) → video ∈ [0,1]
+```
+
+---
+
+## 三、时序与空间去噪的理解
+
+LongLive 的去噪有两层嵌套循环，容易混淆：
+
+```
+"时序"去噪 = 外层循环，决定生成第几帧
+  → 每次处理 num_frame_per_block 帧（通常 3 帧）
+  → 必须顺序执行（第 N 帧要读第 0~N-1 帧的 KV Cache）
+
+"空间"去噪 = 内层循环，对单帧执行多步去噪
+  → 每帧执行 4 步（t=1000→750→500→250）
+  → 每步都调用 generator，KV Cache 被重复读但不重复写
+    （只有 context pass 才最终写入干净帧的 K/V）
+```
+
+**为什么内层去噪时 KV Cache 可以安全重用？**
+
+第 N 帧在去噪时，第 0~N-1 帧已经完成（context pass 后 cache 是干净帧的 K/V）。第 N 帧的去噪是用带噪声的帧去查询历史干净帧的 K/V，这没有问题——历史 K/V 不会被中间去噪步骤修改，直到 context pass。
+
+---
+
+## 四、Context Pass 详解
+
+文件：[causal_inference.py:192-200](../pipeline/causal_inference.py)
 
 ```python
-CausalInferencePipeline(args, device, generator=None, text_encoder=None, vae=None)
+# 去噪循环结束后，denoised_pred 是最终干净帧 (latent)
+context_timestep = torch.ones_like(timestep) * self.args.context_noise  # = 0
+
+self.generator(
+    noisy_image_or_video=denoised_pred,   # ← 干净帧（t=0）
+    conditional_dict=conditional_dict,
+    timestep=context_timestep,             # t=0，σ≈0
+    kv_cache=self.kv_cache1,              # ← 会更新 cache
+    crossattn_cache=self.crossattn_cache,
+    current_start=current_start_frame * self.frame_seq_length,
+)
+# 返回值被丢弃 —— 只要 cache 更新这个副作用
 ```
 
-创建三个模型（或复用外部传入的）：
-- `self.generator` = `WanDiffusionWrapper(is_causal=True, ...)`
-- `self.text_encoder` = `WanTextEncoder()`
-- `self.vae` = `WanVAEWrapper()`
+**为什么需要 Context Pass？**
 
-关键超参数：
-```python
-self.denoising_step_list       # [1000, 750, 500, 250] 每帧的去噪步骤
-self.frame_seq_length = 1560   # 每帧 token 数（硬编码）
-self.num_transformer_blocks = 30
-self.local_attn_size           # 来自 args.model_kwargs.local_attn_size
-self.num_frame_per_block       # 每次生成几帧（默认 1 或 3）
 ```
+去噪步骤中 KV Cache 的状态演变：
+
+步骤1 (t=1000): generator(noisy1) → 写入"重噪声帧"的 K/V
+步骤2 (t=750):  generator(noisy2) → 覆盖为"中等噪声帧"的 K/V
+步骤3 (t=500):  generator(noisy3) → 覆盖为"轻微噪声帧"的 K/V
+步骤4 (t=250):  generator(noisy4) → 覆盖为"接近干净帧"的 K/V
+                                       ↑ 但还不是真正的干净帧！
+
+Context Pass (t=0): generator(clean) → 覆盖为"完全干净帧"的 K/V ✓
+```
+
+如果没有 Context Pass，下一帧的注意力看到的历史 K/V 对应带噪声的特征表示，随着帧数增加，累积误差会让视频质量越来越差。
+
+**t=0 意味着什么？**
+
+Flow Matching 公式：`x_t = (1-σ_t)×x_0 + σ_t×ε`
+
+当 `t=0` 时，`σ_0 = 0`，所以 `x_0 = x_0`（干净帧）。模型的 timestep embedding 也传入 0，"知道"当前输入是干净数据，生成的 K/V 代表干净帧的特征。
 
 ---
 
-## 三、inference() — 核心推理循环
+## 五、KV Cache 初始化
 
-```python
-inference(
-    noise: [B, T, 16, 60, 104],    # 纯高斯噪声（用户提供种子即可）
-    text_prompts: List[str],         # 文本提示词
-    return_latents: bool = False,
-    low_memory: bool = False
-) → video: [B, T, 3, 480, 832]  (像素值 [0,1])
-```
+文件：[causal_inference.py:245-283](../pipeline/causal_inference.py)
 
-**完整执行流程：**
-
-```
-Step 1: 文本编码
-  text_encoder(text_prompts) → conditional_dict
-
-Step 2: 初始化缓存
-  _initialize_kv_cache(batch_size, dtype, device)
-      → kv_cache1: List[30 × {k,v,global_end,local_end}]
-  _initialize_crossattn_cache(...)
-      → crossattn_cache: List[30 × {k,v,is_init}]
-
-Step 3: 时序去噪循环 (outer loop, 逐帧块)
-  for current_start_frame in [0, 1, 2, ..., num_blocks-1]:
-    noisy_input = noise[:, current_start_frame : +num_frame_per_block]
-
-    Step 3.1: 空间去噪循环 (inner loop, 多步去噪)
-      for timestep in [1000, 750, 500, 250]:
-        _, denoised_pred = generator(
-            noisy_input, conditional_dict, timestep,
-            kv_cache=kv_cache1,
-            current_start=current_start_frame × 1560
-        )
-        if 不是最后一步:
-            noisy_input = scheduler.add_noise(denoised_pred, noise, next_timestep)
-
-    Step 3.2: 记录 clean 帧
-      output[:, current_start_frame] = denoised_pred
-
-    Step 3.3: KV Cache 更新（context pass）
-      generator(
-          noisy_image=denoised_pred,   ← 用 clean 帧
-          timestep = context_noise,    ← t ≈ 0
-          kv_cache=kv_cache1,
-          current_start=...
-      )
-      ← 这次 forward 只是为了把 clean 帧的 K/V 写入 cache，不保存输出
-
-    current_start_frame += num_frame_per_block
-
-Step 4: VAE 解码
-  video = vae.decode_to_pixel(output)  或  decode_to_pixel_chunk（Infinity 模式）
-  video = (video * 0.5 + 0.5).clamp(0, 1)  ← [-1,1] → [0,1]
-```
-
----
-
-## 四、为什么需要 Context Pass？
-
-去噪完成后，KV Cache 中存储的是**带噪声**的 K/V（因为 denoise 循环最后一步是从高噪声状态预测 x0，但写入 cache 的是这个噪声帧的 K/V）。
-
-为了让后续帧能获得**干净的历史上下文**，需要额外跑一次 `t=0`（或 `context_noise`）的前向：
-
-```
-context pass 作用:
-  输入: denoised_pred（clean 帧）+ t ≈ 0
-  输出: 被丢弃
-  副作用: 将 clean 帧的 K/V 写入 cache，覆盖之前的噪声 K/V
-
-这样下一帧生成时，看到的历史是干净的帧，而不是中间噪声状态。
-```
-
-这是 **Self-Forcing**（自强迫）训练中的核心设计：训练时学会从干净上下文预测，推理时也维持干净上下文。
-
----
-
-## 五、KV Cache 初始化细节
+### 5.1 `_initialize_kv_cache`
 
 ```python
-# local attention 模式
-kv_cache_size = local_attn_size × frame_seq_length  # e.g. 12 × 1560 = 18720
-
-# global attention 模式（local_attn_size == -1）
-kv_cache_size = num_output_frames × frame_seq_length  # e.g. 120 × 1560
-
-# 每 Block 的 kv_cache:
-{
-    "k": zeros([B, kv_cache_size, 12, 128]),
-    "v": zeros([B, kv_cache_size, 12, 128]),
-    "global_end_index": tensor([0]),
-    "local_end_index":  tensor([0])
-}
+def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override=None):
+    kv_cache_size = kv_cache_size_override or (local_attn_size * frame_seq_length)
+    
+    for _ in range(30):  # 30 个 block
+        kv_cache1.append({
+            "k": torch.zeros([B, kv_cache_size, 12, 128], dtype, device),
+            "v": torch.zeros([B, kv_cache_size, 12, 128], dtype, device),
+            "global_end_index": torch.tensor([0], torch.long, device),
+            "local_end_index":  torch.tensor([0], torch.long, device)
+        })
+    self.kv_cache1 = kv_cache1
 ```
 
----
+- 初始全零（之后 direct_insert 会逐渐填充）
+- `global_end_index = 0` 标志"尚未生成任何帧"
 
-## 六、Profiling 支持
-
-设置 `profile=True` 时，会用 CUDA Events 精确测量各阶段耗时：
-- 初始化（文本编码 + cache 初始化）
-- 扩散生成（每 block 单独计时）
-- VAE 解码
-
----
-
-## 七、low_memory 模式
+### 5.2 `_initialize_crossattn_cache`
 
 ```python
-if low_memory:
-    output_device = 'cpu'   # 生成的 latent 放 CPU
-    # 文本编码器需要时 offload 到 CPU，释放显存给生成器
-    move_model_to_device_with_memory_preservation(self.text_encoder, ...)
+for _ in range(30):
+    crossattn_cache.append({
+        "k": torch.zeros([B, 512, 12, 128], dtype, device),
+        "v": torch.zeros([B, 512, 12, 128], dtype, device),
+        "is_init": False    # 首次 forward 时计算，之后复用
+    })
 ```
 
-这样大容量的文本编码器权重（UMT5-XXL ~15GB）在推理生成阶段可以从 GPU 移走，节省峰值显存。
+`is_init=False` 时，`cross_attn` 层会计算并存储文本的 K/V，之后改为 `True` 直接复用。
+
+### 5.3 `_set_all_modules_max_attention_size`
+
+```python
+# causal_inference.py:285-318
+# 遍历 generator.model 所有子模块，把 max_attention_size 统一设置
+for name, module in self.generator.model.named_modules():
+    if hasattr(module, "max_attention_size"):
+        setattr(module, "max_attention_size", target_size)
+```
+
+`max_attention_size = local_attn_size × 1560`（sink+window 的总上限）。
+
+---
+
+## 六、low_memory 模式
+
+```python
+# inference.py:62-63
+low_memory = get_cuda_free_memory_gb(device) < 40
+low_memory = True  # 强制开启（代码里硬编码了）
+```
+
+low_memory=True 的效果：
+1. **文本编码器**：通过 `DynamicSwapInstaller` 管理，编码时移到 GPU，完成后移回 CPU
+2. **输出 buffer**：`output = zeros(..., device='cpu')` 存在 CPU，每帧生成后 `.to(output.device)` 拷回
+
+```python
+output_device = torch.device('cpu') if low_memory else noise.device
+output = torch.zeros([B, F, C, H, W], device=output_device, ...)
+
+# 每帧生成后：
+output[:, frame_start:end] = denoised_pred.to(output.device)  # GPU→CPU 拷贝
+```
+
+---
+
+## 七、分布式推理支持
+
+```python
+# inference.py:30-58
+if "LOCAL_RANK" in os.environ:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl", ...)
+    
+# 数据并行：每个 GPU 处理不同的 prompt
+if dist.is_initialized():
+    sampler = DistributedSampler(dataset, shuffle=False)
+else:
+    sampler = SequentialSampler(dataset)
+```
+
+注意：LongLive 推理是**数据并行**（每卡处理不同 prompt），不是张量并行（单视频不跨卡）。
+
+---
+
+## 八、输出视频后处理
+
+```python
+# causal_inference.py:223-224
+video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
+video = (video * 0.5 + 0.5).clamp(0, 1)   # [-1,1] → [0,1]
+```
+
+VAE 解码输出范围 `[-1, 1]`，`×0.5+0.5` 映射到 `[0,1]`，再 clamp 防止异常值。
+
+保存时乘以 255（inference.py）：
+
+```python
+video = 255.0 * torch.cat(all_video, dim=1)   # [0,1] → [0,255]
+write_video(output_path, video[seed_idx], fps=16)
+```
+
+---
+
+## 九、profiling 支持
+
+Pipeline 内置了 CUDA event 计时，通过 `profile=True` 开启：
+
+```python
+video, latents = pipeline.inference(noise, text_prompts, profile=True)
+# 输出：
+# Profiling results:
+#   - Initialization/caching time: 150 ms (0.2%)
+#   - Diffusion generation time: 72000 ms (99.5%)
+#     - Block 0 generation time: 600 ms
+#     - Block 1 generation time: 590 ms
+#   - VAE decoding time: 200 ms (0.3%)
+#   - Total time: 72350 ms
+```

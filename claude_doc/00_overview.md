@@ -1,186 +1,255 @@
-# LongLive 代码库全貌
+# LongLive 总览：名词·动词·引擎·点火钥匙 & Call Graph
 
-> 本文档从名词、动词、引擎、点火钥匙四个角度对 LongLive 进行系统梳理，附模块结构与核心调用图。
-
----
-
-## 一、名词表（概念词汇）
-
-| 名词 | 含义 |
-|------|------|
-| **Latent Frame（潜帧）** | 经 VAE 编码后的视频帧，形状 `[C=16, H/8, W/8]`。1 帧 = 1560 个 token（60×104/patch(2,2) = 30×52 = 1560）。 |
-| **KV Cache（键值缓存）** | 每个 Transformer Block 独立维护的 `{"k": [B, cache_size, 12, 128], "v": ..., "global_end_index", "local_end_index"}` 字典，用于避免历史帧重复计算。 |
-| **Frame Sink（帧锚点）** | KV Cache 中永久保留的前 `sink_size` 帧（默认 3），无论 cache 满多少次都不会被驱逐，保持全局语义一致性。 |
-| **Local Attention Window** | `local_attn_size`（默认 12 帧）控制的滑动窗口，每帧只关注最近 12 帧而非全部历史，内存复杂度从 O(n²) 降为 O(n·w)。 |
-| **Flow Matching** | Wan2.1 使用的生成范式：`flow_pred = noise - x0`，对应速度场。`xt = (1-σt)·x0 + σt·noise`。 |
-| **x0 prediction（clean 预测）** | 从噪声帧 `xt` 和 `flow_pred` 反推出的 clean latent：`x0 = xt - σt · flow_pred`。 |
-| **Denoising Step List** | 推理时的多步去噪序列，例如 `[1000, 750, 500, 250]`，每帧依次经过多次 denoise 迭代。 |
-| **Context Noise** | 帧生成完毕后，以极小噪声（`t ≈ 0`）重跑 transformer，将 **干净帧** 写入 KV Cache，供后续帧作为上下文参考。 |
-| **Block Mask** | FlexAttention 编译的块级因果掩码：同 chunk 内全局可见，跨 chunk 只看过去。 |
-| **RoPE（旋转位置编码）** | 3D RoPE，分别对时间 (T)、高度 (H)、宽度 (W) 维度独立编码频率，`causal_rope_apply` 支持从任意 `start_frame` 开始。 |
-| **Generator（生成器）** | 被训练的 `CausalWanModel`（1.3B），使用因果注意力逐帧生成，参数梯度开启。 |
-| **Real Score / Teacher（真实分布）** | 冻结的 `Wan2.1-T2V-14B`，提供真实数据分布的梯度指导，`requires_grad_(False)`。 |
-| **Fake Score / Critic（假分布）** | 与 Generator 同架构的辅助模型，拟合生成器产生的分布，`requires_grad_(True)`。 |
-| **DMD（分布匹配蒸馏）** | 核心训练损失，通过对比 fake_score 与 real_score 的预测差来计算 KL 梯度，使生成器向真实分布靠拢。论文：arxiv/2311.18828。 |
-| **Streaming Training（流式训练）** | 将长视频（240 帧）切成 21 帧的 chunk，逐 chunk 生成并蒸馏，KV Cache 跨 chunk 持续保留，避免一次性 OOM。 |
-| **FSDP** | PyTorch Fully Sharded Data Parallel，Generator/Critic/TextEncoder 均用 FSDP 包裹分片。 |
-| **LoRA** | Low-Rank Adaptation，训练阶段插入秩 256 的低秩适配器，仅训练 LoRA 权重，冻结基础模型。 |
+> 本文档是重写前的"地图"，帮助你在代码海洋中定位方向。
 
 ---
 
-## 二、动词表（核心操作）
+## 一、名词表（Things）
 
-| 动词 | 发生在哪里 | 做什么 |
-|------|-----------|--------|
-| **encode** | `WanVAEWrapper.encode_to_latent` | 像素帧 `[B,C,F,H,W]` → latent `[B,F,16,H/8,W/8]` |
-| **decode** | `WanVAEWrapper.decode_to_pixel` | latent → 像素帧，支持分块解码防 OOM |
-| **tokenize/embed** | `WanTextEncoder.forward` | 文本 → UMT5-XXL → 4096-dim context embeddings |
-| **add_noise** | `FlowMatchScheduler.add_noise` | `xt = (1-σt)·x0 + σt·noise`，在 latent 上按 timestep 加噪 |
-| **denoise** | `WanDiffusionWrapper.forward` | 对 `noisy_input` 运行 Transformer，预测 `flow_pred` 和 `x0` |
-| **cache_update** | `CausalWanModel._apply_cache_updates` | 把新帧的 K/V 写入 KV Cache；满时先 roll（左移驱逐旧帧），再插入 |
-| **recache** | `InteractiveCausalInferencePipeline._recache_after_switch` | prompt 切换后，用新 prompt 重跑历史帧，刷新 KV Cache |
-| **unroll** | `SelfForcingTrainingPipeline.inference_with_trajectory` | 从纯噪声自回归展开生成整段视频，逐帧 denoise + cache_update |
-| **distill** | `DMD.generator_loss` / `DMD.critic_loss` | 先 unroll，再用 DMD 损失对 Generator/Critic 反向传播 |
-| **roll & evict** | `CausalWanSelfAttention.forward` | KV Cache 满时将 sink 之后的旧 tokens 左移（roll），腾出位置写新帧 |
+| 名词 | 含义 | 代码位置 |
+|------|------|---------|
+| **Latent Frame（潜帧）** | VAE 压缩后的视频帧，shape `[C=16, H=60, W=104]`，1帧对应 1560 个 token | `utils/wan_wrapper.py` |
+| **Token** | Latent 经 patch_embedding 后的最小单元，每帧 `60/2 × 104/2 = 1560` 个 | `wan/modules/causal_model.py:946` |
+| **KV Cache** | 存储历史帧 Key/Value 的张量字典列表，每个 block 一份 | `pipeline/causal_inference.py:261` |
+| **KV Cache (local_end_index)** | Cache 数组里当前有效数据的末尾位置 | `wan/modules/causal_model.py:244` |
+| **KV Cache (global_end_index)** | 全局已生成的 token 数（绝对坐标），只增不减 | `wan/modules/causal_model.py:288` |
+| **Frame Sink** | 前 N 帧永久占据 cache 开头，不被驱逐 | `wan/modules/causal_model.py:214` |
+| **Context Pass** | 帧生成后用干净帧（t=0）再跑一次 forward，仅为更新 KV Cache | `pipeline/causal_inference.py:192` |
+| **KV-Recache** | prompt 切换后，用新 prompt 重写历史帧的 KV Cache | `pipeline/interactive_causal_inference.py:34` |
+| **BlockMask** | FlexAttention 的稀疏注意力掩码，实现因果 + 滑动窗口约束 | `wan/modules/causal_model.py:636` |
+| **denoising_step_list** | 每帧的多步去噪 timestep 序列，如 `[1000,750,500,250]` | `pipeline/causal_inference.py:33` |
+| **flow_pred** | 模型输出的"噪声方向"向量（Flow Matching 的速度场） | `utils/wan_wrapper.py:231` |
+| **pred_x0** | 从 flow_pred 换算出的"干净帧"预测 | `utils/wan_wrapper.py:347` |
+| **sigma_t** | 对应 timestep 的噪声强度，Flow Matching 公式 `x_t = (1-σ)x_0 + σ·ε` | `utils/wan_wrapper.py:254` |
+| **CausalWanModel** | 魔改后的 Wan DiT backbone，支持 KV Cache 和因果注意力 | `wan/modules/causal_model.py:499` |
+| **WanDiffusionWrapper** | 封装 CausalWanModel，负责 flow↔x0 转换、scheduler 绑定 | `utils/wan_wrapper.py:171` |
+| **WanTextEncoder** | UMT5-XXL 文本编码器，输出 `[B, 512, 4096]` 的 prompt embedding | `utils/wan_wrapper.py:16` |
+| **WanVAEWrapper** | 视频 VAE，像素↔潜变量互转 | `utils/wan_wrapper.py:60` |
+| **DMD** | Distribution Matching Distillation，训练用的蒸馏损失模块 | `model/dmd.py:14` |
+| **LoRA** | 低秩适配器，阶段二训练的参数高效微调 | `utils/lora_utils.py` |
+| **FSDP** | Fully Sharded Data Parallel，多卡训练时的显存优化 | `utils/distributed.py` |
 
 ---
 
-## 三、引擎（核心执行单元）
+## 二、动词表（Actions）
+
+| 动词/操作 | 含义 | 代码位置 |
+|-----------|------|---------|
+| **encode** | 像素帧 → latent（VAE 编码） | `wan_wrapper.py:80` |
+| **decode_to_pixel** | latent → 像素帧（VAE 解码） | `wan_wrapper.py:96` |
+| **patch_embedding** | latent → token 序列，Conv3d(16,2048,kernel=(1,2,2)) | `causal_model.py:587` |
+| **unpatchify** | token 序列 → latent（patch_embedding 的逆操作） | `causal_model.py:1222` |
+| **causal_rope_apply** | 给 Q/K 加上带绝对位置偏移的旋转位置编码 | `causal_model.py:32` |
+| **roll_and_insert** | KV Cache 满时左移驱逐旧帧、插入新帧 | `causal_model.py:253` |
+| **context_pass** | 用 t=0 干净帧更新 KV Cache（副作用 only） | `causal_inference.py:192` |
+| **_recache_after_switch** | prompt 切换后重算历史帧 K/V | `interactive_causal_inference.py:34` |
+| **add_noise** | 根据 scheduler 给 x0 加噪，用于下一去噪步 | `causal_inference.py:173` |
+| **_convert_flow_pred_to_x0** | flow_pred + x_t + σ → x0 | `wan_wrapper.py:231` |
+| **_apply_cache_updates** | 所有 block forward 结束后批量写回 KV Cache | `causal_model.py:837` |
+| **generate_chunk_with_cache** | 流式训练中逐 chunk 生成并累积 KV Cache | `pipeline/streaming_training.py:73` |
+
+---
+
+## 三、引擎（Core Engines）
+
+LongLive 有三个主要"引擎"，各司其职：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    LongLive 引擎层级                              │
-│                                                                   │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  CausalWanModel  (wan/modules/causal_model.py)           │    │
-│  │  ┌─────────────────────────────────────────────────┐    │    │
-│  │  │  [×30] CausalWanAttentionBlock                  │    │    │
-│  │  │  ┌─────────────┐ ┌──────────────┐ ┌──────────┐ │    │    │
-│  │  │  │ CausalWan   │ │WanCrossAttn  │ │  FFN     │ │    │    │
-│  │  │  │ SelfAttn    │ │(text context)│ │          │ │    │    │
-│  │  │  │ + KV Cache  │ │              │ │          │ │    │    │
-│  │  │  └─────────────┘ └──────────────┘ └──────────┘ │    │    │
-│  │  └─────────────────────────────────────────────────┘    │    │
-│  │  ┌─────────────────────────────────────────────────┐    │    │
-│  │  │  CausalHead  (输出 unpatchify 到 latent)         │    │    │
-│  │  └─────────────────────────────────────────────────┘    │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                           ▲                                       │
-│  ┌────────────────────────┴────────────────────────────────┐    │
-│  │  WanDiffusionWrapper  (utils/wan_wrapper.py)            │    │
-│  │  flow_pred → x0 转换 │ FlowMatchScheduler               │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                           ▲                                       │
-│  ┌────────────────────────┴────────────────────────────────┐    │
-│  │  Pipeline 层  (pipeline/)                               │    │
-│  │  CausalInferencePipeline                                │    │
-│  │  ├── InteractiveCausalInferencePipeline  (多提示词)      │    │
-│  │  ├── SwitchCausalInferencePipeline  (单次切换)           │    │
-│  │  └── SelfForcingTrainingPipeline  (训练展开)             │    │
-│  │       └── StreamingTrainingPipeline  (流式训练展开)       │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                           ▲                                       │
-│  ┌────────────────────────┴────────────────────────────────┐    │
-│  │  Model 层  (model/)                                     │    │
-│  │  BaseModel  →  SelfForcingModel  →  DMD  →  DMDSwitch   │    │
-│  │  generator + real_score + fake_score + text_encoder + vae│    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                           ▲                                       │
-│  ┌────────────────────────┴────────────────────────────────┐    │
-│  │  Trainer  (trainer/distillation.py)                     │    │
-│  │  分布式初始化、FSDP、LoRA、优化器、checkpoint、日志       │    │
-│  └──────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    引擎一：生成引擎                        │
+│  CausalWanModel (_forward_inference)                     │
+│  - 30层 CausalWanAttentionBlock                          │
+│  - 每层：因果自注意力(KV Cache) + 交叉注意力(文本) + FFN  │
+│  - FlexAttention (BlockMask 驱动)                        │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                    引擎二：调度引擎                        │
+│  FlowMatchScheduler                                      │
+│  - 管理 1000步 sigma 曲线                                 │
+│  - add_noise: x_0 → x_t                                 │
+│  - 推理时按 denoising_step_list 跳步执行                  │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                    引擎三：蒸馏引擎（训练）                 │
+│  DMD (Distribution Matching Distillation)               │
+│  - generator: 学生模型（产生视频）                         │
+│  - fake_score: 评判模型（判断真实性）                      │
+│  - KL散度梯度驱动 generator 逼近真实分布                   │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 四、点火钥匙（入口文件）
+## 四、点火钥匙（Entry Points）
 
-| 入口 | 文件 | 触发的核心链路 |
-|------|------|----------------|
-| **单提示词推理** | `inference.py` → `inference.sh` | `CausalInferencePipeline.inference()` |
-| **多提示词交互推理** | `interactive_inference.py` → `interactive_inference.sh` | `InteractiveCausalInferencePipeline.inference()` |
-| **阶段一训练（初始化）** | `train.py` → `train_init.sh` | `Trainer.__init__` + `Trainer.train()` + `DMD.generator_loss/critic_loss` |
-| **阶段二训练（长调优）** | `train.py` → `train_long.sh` | 同上，但启用 `streaming_training=True`，使用 `StreamingTrainingModel` |
+| 入口 | 用途 | 关键参数 |
+|------|------|---------|
+| `inference.py` | 单 prompt 长视频生成 | `--config_path configs/longlive_inference.yaml` |
+| `interactive_inference.py` | 多 prompt 交互式生成 | `--config_path configs/longlive_interactive_inference.yaml` |
+| `train.py` | 训练（需要 torchrun 多卡） | `--config_path configs/longlive_train_init.yaml` |
+| `inference.sh` | 封装 inference.py 的 shell 脚本 | 读取 YAML 配置 |
+| `interactive_inference.sh` | 封装 interactive_inference.py | 读取 YAML 配置 |
 
 ---
 
-## 五、主要模块 Call Graph（推理路径）
+## 五、主要模块结构
+
+```
+LongLive/
+├── inference.py              ← 推理入口（点火钥匙）
+├── interactive_inference.py  ← 交互推理入口
+├── train.py                  ← 训练入口
+│
+├── pipeline/                 ← 推理/训练流程协调器
+│   ├── causal_inference.py   ← 单 prompt 推理 Pipeline
+│   ├── interactive_causal_inference.py  ← 多 prompt 推理 Pipeline
+│   ├── self_forcing_training.py         ← SelfForcing 训练 Pipeline
+│   ├── streaming_training.py            ← 流式长视频训练 Pipeline
+│   └── streaming_switch_training.py     ← Switch 版流式训练
+│
+├── model/                    ← 模型定义（训练用）
+│   ├── base.py              ← SelfForcingModel 基类
+│   ├── dmd.py               ← DMD 蒸馏损失
+│   ├── dmd_switch.py        ← DMDSwitch（含 prompt 切换）
+│   └── streaming_training.py ← 流式训练模型封装
+│
+├── trainer/
+│   └── distillation.py      ← ScoreDistillationTrainer（训练主循环）
+│
+├── wan/                      ← Wan 基础模型（修改版）
+│   └── modules/
+│       ├── causal_model.py   ← ★ 核心：CausalWanModel（因果注意力+KV Cache）
+│       ├── model.py          ← 原版 WanModel（非因果，训练初始化用）
+│       ├── attention.py      ← FlashAttention 封装
+│       ├── vae.py            ← 视频 VAE
+│       └── t5.py             ← UMT5-XXL 文本编码器
+│
+└── utils/
+    ├── wan_wrapper.py        ← ★ WanDiffusionWrapper/TextEncoder/VAE 封装
+    ├── scheduler.py          ← FlowMatchScheduler
+    ├── lora_utils.py         ← LoRA 配置与加载
+    ├── memory.py             ← 显存管理、DynamicSwap
+    └── distributed.py        ← FSDP、EMA 工具
+```
+
+---
+
+## 六、完整 Call Graph（推理路径）
 
 ```
 inference.py
+│
+├── CausalInferencePipeline.__init__
+│   ├── WanDiffusionWrapper.__init__          # 加载 CausalWanModel
+│   ├── WanTextEncoder.__init__               # 加载 UMT5-XXL
+│   └── WanVAEWrapper.__init__               # 加载 VAE
+│
 └── CausalInferencePipeline.inference(noise, text_prompts)
+    │
     ├── WanTextEncoder.forward(text_prompts)
-    │   └── UMT5-XXL encoder → prompt_embeds [B, 512, 4096]
-    ├── _initialize_kv_cache()          # 初始化 30 块 kv_cache
-    ├── _initialize_crossattn_cache()   # 初始化 30 块 crossattn_cache
-    └── [loop per frame block]
-        ├── [loop per denoising step]
-        │   └── WanDiffusionWrapper.forward(noisy_input, cond, timestep, kv_cache)
-        │       └── CausalWanModel._forward_inference(x, t, context, ...)
-        │           ├── patch_embedding(x)         # Conv3d patchify
-        │           ├── time_embedding(t)           # sinusoidal + MLP
-        │           ├── text_embedding(context)     # Linear proj
-        │           └── [×30 blocks] CausalWanAttentionBlock.forward
-        │               ├── CausalWanSelfAttention.forward  ← KV Cache 读写
-        │               │   ├── causal_rope_apply(q/k, start_frame)
-        │               │   ├── [roll_and_insert / direct_insert]
-        │               │   └── attention(q, k_cat, v_cat)  ← FA2/FA3/SDPA
-        │               ├── WanCrossAttention.forward(context)
-        │               └── FFN
-        │           ├── _apply_cache_updates(kv_cache, updates)
-        │           └── CausalHead → unpatchify → latent
+    │   └── UMT5.forward → prompt_embeds [B,512,4096]
+    │
+    ├── _initialize_kv_cache()                # 分配 30×{k,v,indices} 张量
+    ├── _initialize_crossattn_cache()         # 分配 30×{k,v,is_init} 张量
+    │
+    └── for each frame_block:                 # 外层：逐帧块循环
+        │
+        ├── for each timestep in denoising_step_list:   # 内层：多步去噪
+        │   │
+        │   └── WanDiffusionWrapper.forward(noisy, cond, t, kv_cache)
+        │       ├── CausalWanModel._forward_inference(x, t, context, ...)
+        │       │   ├── patch_embedding(x)              # latent → token
+        │       │   ├── time_embedding(t) → e           # 时间条件
+        │       │   ├── text_embedding(context) → ctx   # 文本条件
+        │       │   └── for each block in 30 blocks:
+        │       │       └── CausalWanAttentionBlock.forward(x, e, ctx, kv_cache[i])
+        │       │           ├── CausalWanSelfAttention.forward(x, kv_cache[i])
+        │       │           │   ├── q,k,v = qkv_fn(x)
+        │       │           │   ├── causal_rope_apply(q, start_frame=N)
+        │       │           │   ├── causal_rope_apply(k, start_frame=N)
+        │       │           │   ├── [roll_and_insert 或 direct_insert] → temp_k,v
+        │       │           │   └── attention(q, cat[sink,window]) → x
+        │       │           ├── cross_attn(x, context, crossattn_cache)
+        │       │           └── ffn(x)
+        │       │   └── _apply_cache_updates(kv_cache, infos)   # 批量写回
+        │       │   └── head(x) → unpatchify → [C,F,H,W]
         │       └── _convert_flow_pred_to_x0 → pred_x0
-        └── [context pass] re-run with t≈0 to write clean KV Cache
-    └── WanVAEWrapper.decode_to_pixel(output_latents)
-        └── _video_vae.decode → 像素视频 [B,T,C,H,W]
-```
-
-```
-trainer/distillation.py
-└── Trainer.train()  [无限循环]
-    ├── fwdbwd_one_step / fwdbwd_one_step_streaming
-    │   ├── WanTextEncoder → conditional_dict
-    │   ├── [train_generator=True]
-    │   │   └── DMD.generator_loss
-    │   │       ├── _run_generator → SelfForcingTrainingPipeline.inference_with_trajectory
-    │   │       │   └── [逐帧 unroll + context KV update]
-    │   │       └── compute_distribution_matching_loss
-    │   │           ├── fake_score(noisy_latent)  ← Critic 预测
-    │   │           ├── real_score(noisy_latent)  ← Teacher 预测
-    │   │           └── grad = fake - real; loss = MSE(x0, x0 - grad)
-    │   └── [train_generator=False]
-    │       └── DMD.critic_loss
-    │           ├── generator unroll (no grad)
-    │           └── fake_score denoising loss (grad)
-    ├── loss.backward()
-    ├── clip_grad_norm_
-    └── optimizer.step()
+        │
+        ├── [非最后步] add_noise(pred_x0) → noisy_input (下一步输入)
+        │
+        ├── output[frame] = denoised_pred      # 记录干净帧
+        │
+        └── [context pass] WanDiffusionWrapper.forward(clean, t=0, kv_cache)
+            └── 只为写入干净帧的 K/V，输出丢弃
+    │
+    └── WanVAEWrapper.decode_to_pixel(latents) → video [0,1]
 ```
 
 ---
 
-## 六、关键超参数速查
+## 七、完整 Call Graph（交互推理路径 - prompt 切换时）
 
-| 参数 | 训练默认值 | 推理默认值 | 含义 |
-|------|-----------|-----------|------|
-| `local_attn_size` | 12 | 12 | 滑动窗口帧数，-1 为全局 |
-| `sink_size` | 3 | 3 | 锚定帧数，永不驱逐 |
-| `num_frame_per_block` | 3 | 3 | 每次生成的帧数块 |
-| `denoising_step_list` | [1000,750,500,250] | [1000,750,500,250] | 每帧的去噪步骤 |
-| `context_noise` | 0 | 0 | KV Cache 更新时的噪声强度 |
-| `streaming_chunk_size` | 21 | N/A | 流式训练每个 chunk 的帧数 |
-| `frame_seq_length` | 1560 | 1560 | 每帧的 token 数（硬编码）|
+```
+interactive_causal_inference.py
+│
+└── InteractiveCausalInferencePipeline.inference(noise, text_prompts_list, switch_frame_indices)
+    │
+    ├── WanTextEncoder(prompts) × N_segments → cond_list
+    │
+    ├── 初始化 KV Cache / CrossAttn Cache
+    │
+    └── for each frame_block:
+        │
+        ├── [if 到达切换点] _recache_after_switch(output, frame_idx, new_cond)
+        │   ├── CrossAttn Cache 清零 (is_init=False)
+        │   ├── [if not global_sink] KV Cache 清零
+        │   └── WanDiffusionWrapper.forward(历史干净帧, new_cond, t=0, kv_cache)
+        │       └── 用新 prompt 的语境重写历史帧的 K/V
+        │
+        ├── [去噪循环，同单 prompt 推理]
+        │
+        └── [context pass，同单 prompt 推理]
+```
 
 ---
 
-## 七、数据形状备忘
+## 八、完整 Call Graph（流式训练路径）
 
 ```
-pixel video:   [B, T, C=3, H=480, W=832]
-latent video:  [B, T, C=16, H=60, W=104]
-1 latent frame token count: 60/2 × 104/2 = 30 × 52 = 1560
-KV cache per block: [B, cache_tokens, n_heads=12, head_dim=128]
-text context: [B, seq_len=512, text_dim=4096] → [B, 512, dim=2048]
+train.py → ScoreDistillationTrainer.train()
+│
+└── for each training step:
+    │
+    └── DMD.forward(noise, conditional_dict)
+        │
+        ├── [warmup] StreamingTrainingPipeline.generate_chunk_with_cache(
+        │              noise=chunk_noise, requires_grad=False)
+        │   └── 生成 chunk0，写入 KV Cache，梯度关闭
+        │
+        ├── [training] StreamingTrainingPipeline.generate_chunk_with_cache(
+        │               noise=chunk_noise, requires_grad=True)
+        │   └── 生成 chunk1+，梯度开启，计算 DMD loss
+        │
+        ├── DMD._compute_kl_grad(fake_score, estimated_x0, ...)
+        │   ├── fake_score.forward(x_t, t, cond)      # 判别器评分
+        │   └── kl_grad = fake_score - real_score      # KL 散度梯度
+        │
+        └── optimizer.step()
 ```
+
+---
+
+## 九、关键超参数速查
+
+| 参数 | 含义 | 典型值 |
+|------|------|--------|
+| `local_attn_size` | 滑动窗口（帧数），-1=全局 | 12 |
+| `sink_size` | Frame Sink 帧数 | 3 |
+| `num_frame_per_block` | 每块生成的帧数 | 3 |
+| `denoising_step_list` | 每帧去噪 timestep 序列 | [1000,750,500,250] |
+| `context_noise` | Context Pass 的噪声级别 | 0 |
+| `num_output_frames` | 总生成帧数 | 120（8s@15fps） |
+| `frame_seq_length` | 每帧的 token 数（硬编码） | 1560 |
+| `num_transformer_blocks` | Wan 1.3B 的 DiT 层数（硬编码） | 30 |

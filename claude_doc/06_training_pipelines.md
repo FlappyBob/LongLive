@@ -1,158 +1,236 @@
-# 训练 Pipeline：SelfForcing 与 Streaming
+# 训练 Pipeline：SelfForcing·Streaming·梯度控制
 
-**文件**：
-- [pipeline/self_forcing_training.py](../pipeline/self_forcing_training.py)
-- [pipeline/streaming_training.py](../pipeline/streaming_training.py)
-
----
-
-## 一、定位
-
-训练时的 Pipeline 与推理 Pipeline 最大的区别：**需要保留梯度**，用于反向传播更新 Generator 权重。
-
-两个训练 Pipeline 的分工：
-
-| Pipeline | 用途 | 序列长度 | 特点 |
-|----------|------|----------|------|
-| `SelfForcingTrainingPipeline` | 阶段一训练（init）| 21 帧 | 完整 unroll，支持 `slice_last_frames` 梯度掩码 |
-| `StreamingTrainingPipeline` | 阶段二训练（long）| 21~240 帧，分 chunk | 流式生成，每次生成一个 21 帧 chunk |
+> 核心文件：  
+> [pipeline/self_forcing_training.py](../pipeline/self_forcing_training.py)  
+> [pipeline/streaming_training.py](../pipeline/streaming_training.py)  
+> [pipeline/streaming_switch_training.py](../pipeline/streaming_switch_training.py)
 
 ---
 
-## 二、SelfForcingTrainingPipeline
-
-### 核心方法：inference_with_trajectory()
-
-```python
-inference_with_trajectory(
-    noise: [B, T, C, H, W],
-    initial_latent=None,         # I2V 时的起始帧
-    return_sim_step=False,
-    slice_last_frames=21,        # 只对最后 N 帧计算梯度
-    **conditional_dict
-) → (output, timestep_from, timestep_to)
-```
-
-**梯度控制逻辑**：
+## 一、三种训练 Pipeline 的关系
 
 ```
-start_gradient_frame_index = num_output_frames - slice_last_frames
-
-for block_index in [0, 1, ..., num_blocks-1]:
-    current_start_frame = block_index × num_frame_per_block
-
-    if current_start_frame < start_gradient_frame_index:
-        with torch.no_grad():   ← 不需要梯度的历史帧
-            denoised_pred = generator(...)
-    else:
-        denoised_pred = generator(...)  ← 需要梯度的最后 N 帧
+SelfForcingTrainingPipeline    ← 基础：单 chunk 生成，标准 SelfForcing
+    └── StreamingTrainingPipeline  ← 扩展：多 chunk，跨 chunk 共享 KV Cache
+            └── StreamingSwitchTrainingPipeline  ← 再扩展：含 prompt 切换
 ```
 
-这样只有最后 `slice_last_frames`（默认 21）帧参与梯度计算，节省显存。
+---
 
-### 随机退出步骤（exit_flags）
+## 二、SelfForcing 训练基础概念
 
-```python
-exit_flags = generate_and_sync_list(num_blocks, num_denoising_steps, device)
-# exit_flags: [2, 1, 3, 0, ...]  ← 每帧块随机选择从哪一步退出去噪
+LongLive 继承自 Self-Forcing 框架。Self-Forcing 的核心思路：
+
 ```
+传统扩散训练（DDPM）:
+  给定干净视频 x_0，加噪到 x_t，训练模型预测 x_0
+  问题：测试时每步都用模型自己的输出作为下一步输入（自回归），
+        但训练时用真实 x_0 加噪（"老师强制"），存在训练推理 gap
 
-每个 block 随机选择在第几步"退出"去噪循环（0~N-1），从那步开始计为 final output：
-- 不是 exit_flag 的步骤：`no_grad` 运行，只是为了获得更准确的去噪起点
-- exit_flag 步骤：可能开启梯度，输出 `denoised_pred` 用于 DMD loss
-
-**同步机制**：由 rank 0 生成随机 exit_flags 后 `dist.broadcast` 到所有 GPU，保证梯度同步。
-
-### KV Cache 清空 vs 保持
-
-每次调用 `inference_with_trajectory` 都会重新初始化 cache：
-```python
-self._initialize_kv_cache(batch_size, dtype, device)
-self._initialize_crossattn_cache(batch_size, dtype, device)
+Self-Forcing:
+  训练时也用模型自己生成的视频（而不是真实视频）作为去噪起点
+  → 训练和推理对齐
+  → 配合 DMD 损失（分布匹配蒸馏）保证生成质量
 ```
 
 ---
 
 ## 三、StreamingTrainingPipeline
 
-阶段二训练的核心，支持超出单次能放入显存的长序列训练。
+文件：[pipeline/streaming_training.py:19-233](../pipeline/streaming_training.py)
 
-### generate_chunk_with_cache()
+### 3.1 初始化
 
 ```python
-generate_chunk_with_cache(
-    noise: [B, chunk_frames=21, C, H, W],
-    conditional_dict: dict,
-    current_start_frame: int,   # 在整个序列中的位置
-    requires_grad: bool,
-    return_sim_step: bool
-) → (output_chunk, timestep_from, timestep_to)
+class StreamingTrainingPipeline:
+    def __init__(self, denoising_step_list, scheduler, generator,
+                 num_frame_per_block=3, context_noise=0, **kwargs):
+        
+        self.local_attn_size = kwargs.get("local_attn_size", -1)
+        slice_last_frames = kwargs.get("slice_last_frames", 21)
+        
+        # KV Cache 大小 = 局部窗口 + 额外帧（用于 warmup chunk 的 overlap）
+        self.kv_cache_size = (self.local_attn_size + slice_last_frames) * frame_seq_length
 ```
 
-与 `inference_with_trajectory` 的区别：
-- 只处理一个 chunk（21 帧），不处理全序列
-- `current_start_frame` 参数表明这个 chunk 在整个序列中的位置
-- KV Cache **不在 chunk 之间重置**（跨 chunk 持续保留），这是流式训练的核心
+### 3.2 `generate_chunk_with_cache`
 
-**梯度控制**：
+```python
+def generate_chunk_with_cache(
+    self,
+    noise,              # 当前 chunk 的随机噪声 [B, chunk_frames, 16, 60, 104]
+    conditional_dict,
+    current_start_frame=0,
+    requires_grad=True, # False=warmup chunk（不计算梯度）
+    return_sim_step=False,
+):
+```
+
+**外层循环：逐帧块**
+
+```python
+all_num_frames = [num_frame_per_block] * (chunk_frames // num_frame_per_block)
+
+for block_index, current_num_frames in enumerate(all_num_frames):
+    noisy_input = noise[:, local_start:local_start+current_num_frames]
+    
+    # 决定这个 block 是否需要梯度
+    if block_index * num_frame_per_block < start_gradient_frame_index:
+        grad_ctx = torch.no_grad()
+    else:
+        grad_ctx = contextlib.nullcontext()
+    
+    with grad_ctx:
+        # 内层：多步去噪
+        for step_idx, current_timestep in enumerate(denoising_step_list):
+            ...
+```
+
+**内层循环：多步去噪（同推理，但有梯度）**
+
+```python
+_, denoised_pred = self.generator(
+    noisy_image_or_video=noisy_input,
+    kv_cache=self.kv_cache1,          # ← 跨 chunk 的同一个 cache 对象
+    current_start=(current_start_frame + local_start) * frame_seq_length,
+)
+```
+
+**Context Pass（训练时也有）**
+
+```python
+self.generator(
+    noisy_image_or_video=denoised_pred,   # 干净帧
+    timestep=context_noise * ones(...),    # t=0
+    kv_cache=self.kv_cache1,
+    current_start=...,
+)
+```
+
+### 3.3 梯度控制（requires_grad 参数）
+
 ```python
 if not requires_grad:
-    start_gradient_frame_index = chunk_frames  # 全程 no_grad
+    start_gradient_frame_index = chunk_frames   # 全程 no_grad
 else:
     start_gradient_frame_index = 0             # 全程开梯度
 ```
 
-### 流式训练 vs 整体训练对比
+**Trainer 的调用方式**（[trainer/distillation.py:~1096](../trainer/distillation.py)）：
 
-```
-整体训练（SelfForcingTrainingPipeline）:
-  ┌────────────────────────────────────────────────────────┐
-  │  帧 0~20（no_grad）... 帧 42~62（grad）                 │
-  │  一次性全部 unroll，最后 N 帧开梯度                      │
-  └────────────────────────────────────────────────────────┘
+```python
+# Step 1: Warmup chunk（requires_grad=False）
+# 生成前 N 帧，写入 KV Cache，但不计算梯度（不参与 loss）
+output_warmup = pipeline.generate_chunk_with_cache(
+    noise=warmup_noise,
+    current_start_frame=0,
+    requires_grad=False
+)
 
-流式训练（StreamingTrainingPipeline）:
-  ┌────────────┐ ┌────────────┐ ┌────────────┐
-  │  chunk 0   │→│  chunk 1   │→│  chunk 2   │ ...
-  │  帧 0~20   │ │  帧 21~41  │ │  帧 42~62  │
-  │  (no_grad) │ │  (no_grad) │ │  (grad)    │
-  └────────────┘ └────────────┘ └────────────┘
-  KV Cache 在 chunk 间持续传递，但只在最后几个 chunk 计算梯度
+# Step 2: Training chunk（requires_grad=True）
+# 生成后续帧，KV Cache 里已有前 N 帧的历史，梯度开启
+output_train = pipeline.generate_chunk_with_cache(
+    noise=train_noise,
+    current_start_frame=warmup_frames,
+    requires_grad=True
+)
+
+# 用 output_train 计算 DMD loss，反向传播
+loss = dmd.compute_loss(output_train)
+loss.backward()
 ```
 
 ---
 
-## 四、Context Noise 更新（两个 Pipeline 共有）
-
-每帧生成后都要重跑一次 context pass：
+## 四、KV Cache 在训练中的跨 chunk 持久性
 
 ```python
-context_timestep = context_noise × ones(...)   # 通常 context_noise = 0
-context_noisy = scheduler.add_noise(denoised_pred, randn_like(...), context_timestep)
-
-with torch.no_grad():
-    generator(
-        noisy_image=context_noisy,
-        timestep=context_timestep,
-        kv_cache=kv_cache1,
-        current_start=...
-    )
+class StreamingTrainingPipeline:
+    def initialize_kv_cache(self, batch_size, dtype, device):
+        self.kv_cache1 = [...]   # 初始化一次
+    
+    def generate_chunk_with_cache(self, ...):
+        # self.kv_cache1 是同一个对象，不重置！
+        # 第一次调用写入 chunk0 的 K/V
+        # 第二次调用读取 chunk0 的 K/V + 写入 chunk1 的 K/V
+        ...
 ```
 
-当 `context_noise=0` 时，`context_noisy = denoised_pred`（干净帧），写入 cache 的是完全 clean 的 K/V。
+**这模拟了推理时的行为**：推理时 `self.kv_cache1` 也是同一个对象贯穿整个视频生成。训练时通过这种方式让模型学会"利用历史 KV Cache 保持一致性"。
 
 ---
 
-## 五、local_attn_size 动态调度
+## 五、`exit_flags` 梯度控制（精细版）
 
-`SelfForcingTrainingPipeline` 支持 **per-step 动态调整** `local_attn_size`：
+在 `generate_chunk_with_cache` 内部，还有更精细的 per-block 梯度控制：
 
 ```python
-# 如果 local_attn_size 是一个 list（每个去噪步骤一个值）
-if isinstance(self.local_attn_size, list):
-    for step_idx, timestep in enumerate(denoising_step_list):
-        self.generator.model.local_attn_size = local_attn_size[step_idx]
-        self._set_all_modules_max_attention_size(local_attn_size[step_idx])
+# 每个帧块的去噪步骤中：
+if step_idx == 0 and block_index < start_gradient_block:
+    # 第一步且在梯度起始 block 之前：不保存中间激活
+    torch.cuda.empty_cache()
+
+# 最后一步，且需要梯度：
+if requires_grad and block_index >= start_gradient_block:
+    denoised_pred.requires_grad_(True)   # 开启梯度追踪
 ```
 
-应用场景：早期高噪声步骤用更小的窗口（快速），后期低噪声步骤用更大窗口（精细）。
+---
+
+## 六、Block Mask 的准备
+
+训练路径（`kv_cache=None`）使用 FlexAttention，需要预先准备 BlockMask：
+
+```python
+# 在 streaming_training.py 的 generate_chunk_with_cache 中
+block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
+    device=device,
+    num_frames=current_num_frames,
+    frame_seqlen=1560,
+    num_frame_per_block=self.num_frame_per_block,
+    local_attn_size=self.local_attn_size
+)
+self.generator.model.block_mask = block_mask
+```
+
+训练时 block_mask 是可以缓存的（相同参数的 mask 每次一样），但实际代码中每次 chunk 都重新生成（保守做法，确保正确性）。
+
+---
+
+## 七、两阶段训练概览
+
+| | 阶段一（init）| 阶段二（long） |
+|--|--------------|--------------|
+| 配置 | `longlive_train_init.yaml` | `longlive_train_long.yaml` |
+| 目标 | 基础因果视频生成能力 | 长视频一致性 |
+| 模型 | DMD（完整参数微调） | DMDSwitch + LoRA |
+| local_attn_size | -1（全局）或小窗口 | 12（局部，控制显存）|
+| 训练帧数 | 21 帧（短视频） | 21+21=42 帧（warmup+train） |
+| GPU-days | ~20（32×H100） | ~12（32×H100） |
+
+**阶段二为什么加 LoRA？**
+
+阶段一已经训练了完整参数（~2.5GB）。阶段二在此基础上用 LoRA（~几十MB）做增量微调，专注于长视频的时序一致性，同时保持阶段一学到的基础能力。
+
+---
+
+## 八、teacher_forcing 路径（训练时）
+
+在 `CausalWanSelfAttention` 中，当 `kv_cache=None` 且序列长度是普通长度的 2 倍时，认为是 teacher forcing：
+
+```python
+# causal_model.py:132-135
+is_tf = (s == seq_lens[0].item() * 2)
+if is_tf:
+    # 序列 = [clean_frames | noisy_frames]（拼接后一起处理）
+    # clean 部分和 noisy 部分分别做 rope_apply，保证位置编码一致
+    q_chunk = torch.chunk(q, 2, dim=1)   # 拆成两半
+    ...
+    roped_query = torch.cat(roped_query, dim=1)  # 重新拼接
+```
+
+Teacher Forcing 时，干净帧和噪声帧一起输入，块掩码（`_prepare_teacher_forcing_mask`）控制：
+- 干净帧只能看过去的干净帧（因果）
+- 噪声帧只能看过去的干净帧 + 同一 block 内的噪声帧（不跨 block 互看）
+
+这样可以一次 forward 同时处理所有帧，比逐帧去噪快很多，适合训练初始化阶段。

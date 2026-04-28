@@ -13,6 +13,10 @@
 请你结合代码，详细讲一下longlive的创新之处，我列举在下面了，写在claude_doc里面
 来源：https://deepwiki.com/NVlabs/LongLive/1-longlive-overview
 
+### 小问题
+1. 3D ROPE是怎么加入到causalwan里面的，原理是什么？你先给我讲清楚rope原理是什么？；是干什么的，在哪里加；之后再讲casual_rope是干什么的，在哪里加。答案写入claude_doc里面
+
+
 ## LongLive: Key Innovations
 
 ### 1. Frame-level Autoregressive Video Generation
@@ -102,3 +106,7 @@ LongLive integrates causal attention, KV caching, frame sink, LoRA tuning, and q
 | [09_configs_and_entry.md](claude_doc/09_configs_and_entry.md) | 两阶段配置对比、入口文件、数据格式 |
 | [10_memory_and_distributed.md](claude_doc/10_memory_and_distributed.md) | FSDP、KV Cache 显存估算、梯度检查点兼容性、EMA |
 | [11_innovations_deep_dive.md](claude_doc/11_innovations_deep_dive.md) | **五大创新逐行代码讲解**：因果 RoPE、KV Cache、Frame Sink roll 操作、Context Pass、KV-Recache |
+| [13_rope_explained.md](claude_doc/13_rope_explained.md) | RoPE 原理从零讲起、3D RoPE 频率表构造、rope_apply vs causal_rope_apply 对比（start_frame 偏移机制）|
+| [14_inference_walkthrough.md](claude_doc/14_inference_walkthrough.md) | **推理流程全程导读（重写版）**：每行代码带 Shape 注释，以 longlive_inference.yaml 具体配置为例，覆盖完整调用链 inference.py → WanDiffusionWrapper → CausalWanModel → KV Cache → VAE |
+| [15_self_attn_kv_cache_walkthrough.md](claude_doc/15_self_attn_kv_cache_walkthrough.md) | **CausalWanSelfAttention 推理路径详解**：3D RoPE 应用 + cache 坐标计算 + is_recompute 判断（recompute vs 推进生成）+ 延迟更新 cache_update_info 设计 |
+| [16_self_attn_full_walkthrough.md](claude_doc/16_self_attn_full_walkthrough.md) | **CausalWanSelfAttention.forward() 全程逐行导读**：97-358 行完整讲解，覆盖训练分支（flex_attention + block_mask）和推理分支（causal_rope + roll_and_insert + sink + 滑动窗口 attention），含训练 vs 推理对照表 |

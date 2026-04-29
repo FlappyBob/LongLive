@@ -4,6 +4,49 @@
 
 ---
 
+## Q13：为什么 Phase-2 用 LoRA 而不是全参微调？
+
+**代码位置**：[configs/longlive_train_long.yaml:96-104](../configs/longlive_train_long.yaml#L96-L104)、[trainer/distillation.py:208-212, 1310-1312](../trainer/distillation.py#L208-L212)
+
+### 一句话
+
+**Phase-1 已经把 1.3B 全参练好了，Phase-2 只是在它之上学"长视频一致性"和"prompt 切换"，用 LoRA 增量微调既省显存又能保住已学能力。**
+
+### 五个具体原因
+
+**1. 防止灾难性遗忘**
+Phase-1 的 700 步 DMD 蒸馏已经把 Wan1.3B 改造成 4 步 causal 生成器，这是一份精细的能力。Phase-2 只在 21→240 帧的扩展上做增量调整，全参 + 5× 大学习率（`lr=1e-5` vs `2e-6`）很容易把 Phase-1 学到的短片质量打飞。LoRA 把改动限制在低秩子空间，原权重整体冻结，主体能力安全。
+
+**2. 显存预算根本不够**
+Phase-2 同时塞下了：240 帧序列 + 跨 chunk KV cache `(12+21)*1560` tokens × 30 层 + 14B real_score + 1.3B fake_score（critic 也要 LoRA: `apply_to_critic=true`）+ FSDP 通信 buffer。全参 AdamW 的 optimizer state（参数本身的 4×：fp32 master + m + v + grad）会再吃几个 GB。LoRA r=256 的可训参数只占总参数零点几个百分点，optimizer state 从 ~10 GB 量级降到 ~0.3 GB。
+
+**3. 大学习率才能学动 streaming 行为**
+Phase-2 要让模型学会"跨 chunk 复用 KV cache"、"在 switch 帧重置 cross-attn 还能续上"这些新行为，需要 `lr=1e-5`（5× 于 Phase-1）。这种 LR 直接打全参会破坏稳定。LoRA 在低秩子空间里放大学习率风险小很多，等价于"在小流形上大胆走"。
+
+**4. ckpt 体积 / 分发友好**
+全参 ckpt ~2.5 GB，LoRA adapter 只有几十 MB（[distillation.py:746-756](../trainer/distillation.py#L746-L756) 走 `_gather_lora_state_dict` 分支只 dump `generator_lora` + `critic_lora`）。便于发布、版本管理，也便于推理时按需切换不同 LoRA。
+
+**5. rank=256, α=256 已经接近全参表达力**
+[longlive_train_long.yaml:99-100](../configs/longlive_train_long.yaml#L99-L100) `rank=256, alpha=256` → scaling = α/r = 1.0。常见 LoRA 是 r=8~64，这里直接拉到 256，target 注意力 q/k/v/o，**实际表达力已经非常接近全参微调**，但仍享受上述四点好处。可以理解为"框定了一个足够大的子空间，但限定从 0 出发的增量"。
+
+### 副作用：EMA 关掉了
+
+LoRA 模式下 EMA 被显式禁用（[distillation.py:1310-1312](../trainer/distillation.py#L1310-L1312)）：
+
+```python
+if self.is_lora_enabled:
+    print("EMA creation skipped at step {self.step} (disabled in LoRA mode)")
+```
+
+原因：EMA 维护参数的滑动平均，对 LoRA 这种"小增量"意义不大；且 LoRA 自身的低秩约束已经提供了足够的训练稳定性，不再需要 EMA 平滑。
+
+### 类比
+
+> Phase-1 像把一辆轿车改装成赛车（全参，慢慢调每个零件）。
+> Phase-2 像在赛车上贴空气动力学套件——不动核心机械，只在外面加可拆卸组件，让它能跑长直道（240 帧）和换赛道（prompt switch）。LoRA 就是这个"可拆卸套件"。
+
+---
+
 ## Q12：current_end > global_end_index 这个条件不是恒为真吗？global_end_index 在哪里更新？
 
 **代码位置**：`causal_model.py:231, 888`，初始化 `pipeline/causal_inference.py:265`
